@@ -34,6 +34,59 @@ function earlier(value: SessionFormatJsonValue | undefined, seq: number, subject
   return coordinate
 }
 
+/**
+ * Reconstruct only user-visible text blocks from a durable attempt stream.
+ * This mirrors the text portion of the Session BlockAssembler without adding
+ * a format -> LLM package dependency or exposing reasoning/tool fragments.
+ */
+function recoveryTextBlocks(value: SessionFormatJsonValue | undefined): readonly string[] {
+  const chunks = array(value, 'recovery source stream')
+  const blocks = new Map<number, { kind: string; text: string; closed: boolean }>()
+  function part(index: SessionFormatJsonValue | undefined, kind: string) {
+    const key = sessionFormatCount(index, 'recovery stream index')
+    let block = blocks.get(key)
+    if (block === undefined) {
+      block = { kind, text: '', closed: false }
+      blocks.set(key, block)
+    }
+    return block
+  }
+  for (const value of chunks) {
+    const record = recordValue(value)
+    let chunk: SessionFormatJsonObject | undefined
+    if (record['type'] === 'chunk') chunk = recordValue(record['chunk'])
+    else chunk = record
+    const type = chunk['type']
+    if (type === 'block-start') {
+      part(chunk['index'], text(chunk['blockType'], 'recovery block type'))
+    } else if (type === 'text-chunks' || type === 'reasoning-chunks' || type === 'tool-call-chunks') {
+      const block = part(chunk['index'], type === 'text-chunks' ? 'text' : type === 'reasoning-chunks' ? 'reasoning' : 'tool-call')
+      if (!block.closed && type === 'text-chunks') block.text += array(chunk['texts'], 'recovery text fragments').map(item => textFragment(item)).join('')
+    } else if (type === 'text-delta' || type === 'reasoning-delta' || type === 'tool-call-delta') {
+      const block = part(chunk['index'], type === 'text-delta' ? 'text' : type === 'reasoning-delta' ? 'reasoning' : 'tool-call')
+      if (!block.closed && type === 'text-delta') block.text += textFragment(chunk['text'])
+    } else if (type === 'block-end') {
+      const complete = recordValue(chunk['block'])
+      const block = part(chunk['index'], text(complete['type'], 'recovery completed block type'))
+      if (!block.closed) {
+        block.kind = text(complete['type'], 'recovery completed block type')
+        if (block.kind === 'text') block.text = textFragment(complete['text'])
+        block.closed = true
+      }
+    }
+  }
+  return [...blocks.values()].filter(block => block.kind === 'text' && block.text.trim().length > 0).map(block => block.text)
+}
+
+function recordValue(value: SessionFormatJsonValue | undefined): SessionFormatJsonObject {
+  return record(value, 'recovery stream record')
+}
+
+function textFragment(value: SessionFormatJsonValue | undefined): string {
+  if (typeof value !== 'string') throw new SessionFormatError('recovery text fragment must be a string')
+  return value
+}
+
 interface ToolState {
   readonly name: SessionFormatJsonValue | undefined
   readonly arguments: SessionFormatJsonValue | undefined
@@ -146,6 +199,39 @@ class Relationships {
   }
 
   tool(event: SessionFormatEvent, data: SessionFormatJsonObject): void {
+    // A failed-attempt Recovery is a Surface append, not another provider settlement.
+    if (event.type === 'assistant/message' && data['recovery'] !== undefined) {
+      const recovery = record(data['recovery'], 'assistant recovery')
+      const sourceSeq = earlier(recovery['sourceAttemptSeq'], event.seq, 'recovery source')
+      const source = this.artifact.events[sourceSeq]
+      const sourceData = source?.type === 'assistant/attempt'
+        ? record(source.data, 'recovery source attempt') : undefined
+      const terminal = this.artifact.events.slice(0, event.seq).findLast(item =>
+        item.type === 'turn/end' && isSessionFormatJsonObject(item.data)
+        && item.data['turn'] === data['turn'] && isSessionFormatJsonObject(item.data['reason'])
+        && item.data['reason']['kind'] === 'error')
+      if (event['surfaceOp'] !== 'append' || this.turn !== null || this.step !== null
+        || recovery['reason'] !== 'upstream-failure' || sourceData === undefined
+        || sourceData['turn'] !== data['turn'] || sourceData['step'] !== data['step']
+        || terminal === undefined) {
+        throw new SessionFormatError('assistant recovery has no matching terminal failed attempt')
+      }
+      if (terminal.seq <= sourceSeq || this.artifact.events.slice(0, event.seq).some(item =>
+        item.type === 'assistant/message' && isSessionFormatJsonObject(item.data)
+        && item.data['turn'] === data['turn']
+        && (item.data['step'] === data['step'] || item.data['recovery'] !== undefined))) {
+        throw new SessionFormatError('assistant recovery duplicates a message or has no later failed terminal')
+      }
+      const message = record(data['message'], 'recovery assistant message')
+      const content = array(message['content'], 'recovery assistant content')
+      const emitted = recoveryTextBlocks(sourceData['stream'])
+      if (emitted.length === 0 || emitted.length !== content.length
+        || content.some((block, index) => !isSessionFormatJsonObject(block)
+          || block['type'] !== 'text' || block['text'] !== emitted[index])) {
+        throw new SessionFormatError('assistant recovery must exactly match source visible text')
+      }
+      return
+    }
     if (event.type === 'tool/result' && event['surfaceOp'] !== 'append') {
       this.requireTurn(event.type)
       return

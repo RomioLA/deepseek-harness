@@ -208,7 +208,7 @@ function finalNode(
         firstTokenTime: state.firstTokenTime ?? null,
         completedTime: event.time,
       },
-      ...event.data.interrupted === true ? { interrupted: true } : {},
+      ...event.data.interrupted === true || event.data.recovery !== undefined ? { interrupted: true } : {},
     }
   }
   const location = context.start?.location ?? context.matches.at(-1)?.location
@@ -346,9 +346,16 @@ export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
     const settled = data.finalNode
     const visible = settled === undefined ? state.visibleBlocks > 0 : hasVisibleContent(data.blocks)
     if (settled === undefined && !visible && current == null) return null
-    // A successful message retains its live anchor alongside pending Tool calls.
-    const anchorSeq = (settled?.interrupted === true ? settled.seq : state.firstVisibleSeq ?? settled?.seq)
-      ?? context.matches[0]?.event.seq ?? 0
+    // A recovery may be appended after turn/end; retain the interrupted step's
+    // position before Turn Tail without rewriting the durable message sequence.
+    const recovered = state.final?.event.type === 'assistant/message'
+      && state.final.event.data.recovery !== undefined
+    const location = context.start?.location ?? context.matches.at(-1)?.location
+    const boundary = location === undefined ? undefined : closedBoundary(location)
+    const anchorSeq = recovered && boundary !== undefined
+      ? boundary.seq + CHAT_SYNTHETIC_SEQ_OFFSETS.interruptedAssistant
+      : (settled?.interrupted === true ? settled.seq : state.firstVisibleSeq ?? settled?.seq)
+        ?? context.matches[0]?.event.seq ?? 0
     return chatNode(context, 'assistant-step', anchorSeq, data, {
       visibility: settled?.interrupted === true || visible ? 'visible' : 'hidden',
     })

@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Session, SessionId, SessionLogOffset, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import { sessionFormatCatalog } from '@deepseek-ai/dsh-session-format-catalog'
@@ -214,5 +217,72 @@ describe('V4 protected system surface and malformed relationship inputs', () => 
       row('turn/end', { turn: 1, reason: { kind: 'completed' } }), row('session/end-seed', { inherited: true }),
     ]
     expect(() => reopen(inherited, 5, true)).toThrow(/does not match the open turn/)
+  })
+})
+
+
+describe('V4 failed-attempt Recovery terminal append', () => {
+  const visible = 'fixture visible text retained after upstream error'
+  const recovered = (text = visible): Row => ({
+    ...assistant([{ type: 'text', text }]),
+    data: {
+      ...assistant([{ type: 'text', text }]).data,
+      recovery: { sourceAttemptSeq: 2, reason: 'upstream-failure' },
+    },
+  })
+  const failed = (stream: unknown[] = [
+    { type: 'text-chunks', index: 0, time0: 1, dt: [0], texts: [visible] },
+  ]): Row[] => [
+    ...begin(),
+    row('assistant/attempt', { ...step, stream }),
+    row('step/end', step),
+    row('turn/end', { turn: 1, reason: { kind: 'error', error: { code: 'MOCK', message: 'synthetic upstream failure' } } }),
+  ]
+
+  it('A: accepts an exact Recovery message after a terminal failed turn', () => {
+    const result = reopen([...failed(), recovered()])
+    expect(result.messages.at(-1)?.role).toBe('assistant')
+    expect(JSON.stringify(result.messages.at(-1)?.content)).toContain(visible)
+  })
+
+  it('B: persists synthetic format rows to disk and restores into native model-visible Session', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-v4-recovery-fixture-'))
+    try {
+      const path = join(directory, 'synthetic-events.json')
+      writeFileSync(path, JSON.stringify([...failed(), recovered()]))
+      const rows = JSON.parse(readFileSync(path, 'utf8')) as Row[]
+      expect(reopen(rows).messages.at(-1)?.content).toEqual([{ type: 'text', text: visible }])
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('C: preserves the old rejection for ordinary assistant/message after turn/end', () => {
+    expect(() => reopen([...failed(), assistant([{ type: 'text', text: visible }])])).toThrow()
+  })
+
+  it('D: rejects fabricated sources, mismatched coordinates, wrong terminal, duplicates and invented text', () => {
+    const legitimate = [...failed(), recovered()]
+    const changed = (data: Record<string, unknown>): Row =>
+      ({ ...recovered(), data: { ...recovered().data, ...data } })
+    const bad = [
+      [...failed(), changed({ recovery: { sourceAttemptSeq: 1, reason: 'upstream-failure' } })],
+      [...failed(), changed({ recovery: { sourceAttemptSeq: 200, reason: 'upstream-failure' } })],
+      [...failed(), changed({ turn: 2 })],
+      [...failed(), changed({ step: 2 })],
+      [...failed(), changed({ recovery: { sourceAttemptSeq: 2, reason: 'untrusted' } })],
+      [...failed(), recovered('fabricated replacement')],
+      [...legitimate, recovered()],
+      [...failed().slice(0, -1), row('turn/end', { turn: 1, reason: { kind: 'completed' } }), recovered()],
+      [...failed([{ type: 'reasoning-chunks', index: 0, time0: 1, dt: [0], texts: ['reasoning only'] }]), recovered()],
+      [...failed([{ type: 'tool-call-chunks', index: 0, time0: 1, dt: [0], id: 'x', args: ['{}'] }]), recovered()],
+    ]
+    for (const rows of bad) expect(() => reopen(rows)).toThrow()
+  })
+
+  it('E: retains valid old V4 ordinary completed and failed Sessions', () => {
+    const normal = [...begin(), assistant([{ type: 'text', text: 'ordinary success' }]), ...end()]
+    expect(reopen(normal).messages.at(-1)?.role).toBe('assistant')
+    expect(() => reopen(failed())).not.toThrow()
   })
 })

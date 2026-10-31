@@ -347,6 +347,8 @@ export interface SessionEventMap {
     stream: AssistantStreamRecord[]
     usage?: TokenUsage
     interrupted?: true
+    /** Provenance of already emitted text; no additional provider completion. */
+    recovery?: { sourceAttemptSeq: SessionSeq; reason: 'upstream-failure' }
   }
   /**
    * One model attempt that committed no surface message. The embedded stream

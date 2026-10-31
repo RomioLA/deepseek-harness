@@ -12,7 +12,8 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import { assertNever, deepFreeze, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import { scopeOf, scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
-import type { Message } from '@deepseek-ai/dsh-llm'
+import { assembleAssistantStream } from '@deepseek-ai/dsh-llm/assistant-stream'
+import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, SessionLogOffset, SessionSeq } from './types.ts'
 import type { TypertLookup } from '@deepseek-ai/dsh-typert-protocol'
 import type { CreateSessionOptions, EpochHeader, PluginRecord, PluginRecordMap, PluginRecordType, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventMap, SessionEventType, SessionHeader, SessionId, SessionSeedEventState, SurfaceIntent, SurfaceEventType } from './types.ts'
@@ -34,6 +35,9 @@ export type { SessionSurface, SurfaceFoldReplacement, SurfaceFoldResult, Session
 export { deriveEventMessage, foldSurface, isAppendSurfaceEvent, isReplacementSurfaceEvent, isSurfaceEvent, isSurfaceEligibleType } from './surface.ts'
 export { canonicalHeader, foldRequestHeader, headerEquals } from './request-header.ts'
 export { KNOWN_SESSION_EVENT_TYPES } from './known-event-types.ts'
+
+/** Runtime ability required by response recovery plugins. */
+export const RESPONSE_RECOVERY_CONTRACT_VERSION = 1
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -512,6 +516,46 @@ export function pluginRecordOf(event: SessionEvent): PluginRecord | undefined {
 }
 
 /**
+ * Reject fabricated and duplicate failed-attempt recoveries before a durable append.
+ * The visible message must consist exactly of the selected attempt's streamed text.
+ */
+function validateRecoveredAssistant(
+  event: SessionEvent<'assistant/message'>,
+  events: readonly SessionEvent[],
+): void {
+  const { turn, step, message, recovery } = event.data
+  if (recovery === undefined) return
+  const seq = recovery.sourceAttemptSeq
+  if (recovery.reason !== 'upstream-failure' || !Number.isSafeInteger(seq)
+    || seq < 0 || seq >= event.seq) {
+    throw new Error('assistant recovery requires an earlier failed-attempt sequence')
+  }
+  const source = events[seq]
+  if (source?.type !== 'assistant/attempt' || source.data.turn !== turn || source.data.step !== step) {
+    throw new Error('assistant recovery source must match original turn and step')
+  }
+  if (!events.some(item => item.type === 'turn/end'
+    && item.data.turn === turn && item.data.reason.kind === 'error')) {
+    throw new Error('assistant recovery requires a terminal failed turn')
+  }
+  if (events.some(item => item.type === 'assistant/message' && item.data.turn === turn
+    && (item.data.step === step || item.data.recovery !== undefined))) {
+    throw new Error('assistant recovery duplicate or already settled step')
+  }
+  const emitted = assembleAssistantStream(source.data.stream).interruptedBlocks()
+    .filter((block): block is Extract<ContentBlock, { type: 'text' }> =>
+      block.type === 'text' && block.text.trim().length > 0)
+  const identical = emitted.length > 0 && message.content.length === emitted.length
+    && emitted.every((block, index) => {
+      const restored = message.content[index]
+      return restored?.type === 'text' && restored.text === block.text
+    })
+  if (!identical) {
+    throw new Error('assistant recovery content must match the source streamed text')
+  }
+}
+
+/**
  * An event-sourced session: an append-only log of {@link SessionEvent}s.
  *
  * Plain class (not a Service) — create live instances via
@@ -656,6 +700,9 @@ export class Session {
         // live append and a full-log fold. The candidate is planned before it
         // enters `log`, so a failure cannot partially mutate the surface.
         try {
+          if (snapshot.type === 'assistant/message' && snapshot.data.recovery !== undefined) {
+            validateRecoveredAssistant(snapshot as SessionEvent<'assistant/message'>, this.log)
+          }
           this.surfaceManager.validateNext(snapshot)
         } catch (error: unknown) {
           throw new Error(`invalid seed event at index ${index}: ${error instanceof Error ? error.message : 'invalid surface metadata'}`)
@@ -822,6 +869,10 @@ export class Session {
       ...(surfaceMetadataSnapshot as { surfaceOp?: unknown; sourceEventSeqs?: unknown }),
     } as unknown as SessionEvent<T>)
     validateSessionEventData(event, `session event "${type}" at seq ${event.seq}`)
+    const assistantEvent = event as unknown as SessionEvent<'assistant/message'>
+    if (type === 'assistant/message' && assistantEvent.data.recovery !== undefined) {
+      validateRecoveredAssistant(assistantEvent, this.log)
+    }
     this.commit(event as SessionEvent, entry)
     return event
   }

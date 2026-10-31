@@ -388,6 +388,19 @@ export class ReactLoopAgent implements Agent {
       } catch (error: unknown) {
         this.throwError(error)
       }
+      if (turnEnds?.kind === 'error') {
+        try {
+          await this.dispatch.serial('agent/failed-turn-settled', { turn })
+        } catch (error: unknown) {
+          this.ctx.logger.warn('agent failed-turn-settled listener rejected: ' + String(error))
+        }
+        // A waking user message may arrive while the failure hook is awaited.
+        // The terminal exception will unwind the current driver; latch that
+        // message so kick() starts the next turn instead of stranding it.
+        if (this.inbox.hasPending && abortedCancelCause(signal)?.kind !== 'disposed') {
+          phase.wakeRequested = true
+        }
+      }
     }
     if (!this.inbox.hasPending) return false
     phase.abort = new AbortController()

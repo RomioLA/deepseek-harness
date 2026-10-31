@@ -95,7 +95,8 @@ function tailData(context: ConversationNodeContext<TurnTailState>): TurnTailChat
     seq: end.event.seq,
     time: end.event.time,
     closing,
-    branchUnavailable: closing === null || latestTranscriptSeq !== closing.finalNode.seq,
+    branchUnavailable: closing === null || closing.finalNode.interrupted === true
+      || latestTranscriptSeq !== closing.finalNode.seq,
     ...tokenUsage === undefined ? {} : { tokenUsage },
   }
 }

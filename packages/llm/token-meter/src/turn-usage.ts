@@ -201,6 +201,12 @@ export function deriveTurnTokenUsage(events: readonly SessionEvent[]): TurnToken
       invalid = true
       break
     }
+    // Durable recovered text is not a second model call; skip its attempt settlement.
+    // The transcript append may follow the completed turn.
+    if (event.type === 'assistant/message' && event.data.recovery !== undefined) {
+      if (event.data.turn !== turn) invalid = true
+      continue
+    }
     if (event.type === 'turn/end') {
       if (event.data.turn !== turn || state.kind !== 'idle' || sawEnd) invalid = true
       else sawEnd = true
